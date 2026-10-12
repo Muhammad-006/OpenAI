@@ -1,49 +1,73 @@
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
+import json
+import os
+import re
+from datetime import date
 from typing import List
+
+import uvicorn
 from agents import Agent, Runner, function_tool
 from dotenv import load_dotenv
-import os
-import asyncio, json, datetime
-
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="AI Meeting Insight Extractor")
+
+DEADLINE_PATTERN = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")  # DD/MM/YYYY
+
+
+def assess_deadline(days_left: int) -> tuple[str, str]:
+    """Map the number of days left to a risk level and a management plan."""
+    if days_left < 0:
+        return (
+            "High - The deadline has already passed. Re-plan immediately and agree a new date.",
+            "Escalate to the project lead. Re-scope or renegotiate the deadline.",
+        )
+    if days_left <= 3:
+        return (
+            "High - The deadline is very close. Immediate action is required. "
+            "Assign extra resources and prioritize this task in daily stand-ups.",
+            "Assign more team members. Schedule daily stand-ups. Consider scope reduction.",
+        )
+    if days_left <= 7:
+        return (
+            "Medium - The deadline is approaching soon. Progress should be monitored "
+            "closely. Maintain steady pace and consider small check-ins mid-week.",
+            "Keep task visible in sprint. Review progress every two days. Ensure resource availability.",
+        )
+    return (
+        "Low - The deadline is comfortably distant. Continue at regular pace. "
+        "Weekly check-ins are sufficient to stay on track.",
+        "Track casually. Weekly progress check is enough.",
+    )
+
+
+def build_risk_report(data: str, today: date | None = None) -> str:
+    """Find every DD/MM/YYYY date in `data` and assess the risk for each one."""
+    today = today or date.today()
+    lines = []
+    for day, month, year in DEADLINE_PATTERN.findall(data):
+        try:
+            deadline = date(int(year), int(month), int(day))
+        except ValueError:  # e.g. 31/02/2026
+            continue
+        days_left = (deadline - today).days
+        risk, plan = assess_deadline(days_left)
+        lines.append(
+            f"Deadline {deadline.isoformat()} ({days_left} days left)\n"
+            f"Risk strength: {risk}\nManagement Plan: {plan}"
+        )
+    if not lines:
+        return "No valid DD/MM/YYYY deadline found. Risk: Low. Track casually."
+    return "\n\n".join(lines)
+
 
 @function_tool
-def risk_assesment(data: str):
-    """Analyze deadline dates in the text and assess risk accordingly. Deadline should be in DD/MM/YYYY format. Provide a risk management plan accordingly"""
-    this_data = data.split()
-    for prompt in this_data:
-        if '/' in prompt:
-            if int((prompt.split('/'))[1]) == (datetime.date.today()).month:
-                if int((prompt.split('/'))[0]) <= (datetime.date.today()).day + 3:
-                    Risk = "High — The deadline is very close. Immediate action is required. Assign extra resources and prioritize this task in daily stand-ups."
-                    Plan = "Assign more team members. Schedule daily stand-ups. Consider scope reduction."
+def risk_assessment(data: str) -> str:
+    """Analyze every deadline in the text (DD/MM/YYYY) and assess the risk of each, with a management plan."""
+    return build_risk_report(data)
 
-                elif int((prompt.split('/'))[0]) <= (datetime.date.today()).day + 7:
-                    Risk = "Medium — The deadline is approaching soon. Progress should be monitored closely. Maintain steady pace and consider small check-ins mid-week."
-                    Plan = "Keep task visible in sprint. Review progress every two days. Ensure resource availability."
-                else:
-                    Risk = "Low — The deadline is comfortably distant. Continue at regular pace. Weekly check-ins are sufficient to stay on track."
-                    Plan = "Track casually. Weekly progress check is enough."
-
-            elif int((prompt.split('/'))[1]) == (datetime.date.today()).month + 1:
-                if int((prompt.split('/'))[0]) <= (datetime.date.today()).day - 27:
-                    Risk = "High — The deadline is very close. Immediate action is required. Assign extra resources and prioritize this task in daily stand-ups."
-                    Plan = "Assign more team members. Schedule daily stand-ups. Consider scope reduction."
-                elif int((prompt.split('/'))[0]) <= (datetime.date.today()).day - 22:
-                    Risk = "Medium — The deadline is approaching soon. Progress should be monitored closely. Maintain steady pace and consider small check-ins mid-week."
-                    Plan = "Keep task visible in sprint. Review progress every two days. Ensure resource availability."
-                else:
-                    Risk = "Low — The deadline is comfortably distant. Continue at regular pace. Weekly check-ins are sufficient to stay on track."
-                    Plan = "Track casually. Weekly progress check is enough."
-            else:
-                Risk = "Low"
-                Plan = "Track casually. Weekly progress check is enough."
-
-    return f"Risk strength: {Risk}, \nManagement Plan: {Plan}"
 
 class Database(BaseModel):
     key_points: List[str] = Field(description="List of important points")
@@ -52,23 +76,28 @@ class Database(BaseModel):
     solutions: List[str] = Field(description="Solutions to the problems being raised")
     quiz_questions: List[str] = Field(description="Questions and answers that can be done from the data provided")
     todo_list: List[str] = Field(description="What should be done and how?")
-    risk_assesment: str = Field(description="What are the risks associated to the tasks?")
+    risk_assessment: str = Field(description="What are the risks associated to the tasks?")
+
 
 assistant = Agent(
     name="Assistant",
-    instructions=("You are an AI assistant that extracts structured information from meeting notes. "
-                  "If you detect any deadlines in the format DD/MM/YYYY, use the `risk_assesment` tool to assess project risk."
-                  "For the questions that can be asked you also provide the answers that can be given as response."),
+    instructions=(
+        "You are an AI assistant that extracts structured information from meeting notes. "
+        "If you detect any deadlines in the format DD/MM/YYYY, use the `risk_assessment` tool to assess project risk. "
+        "For the questions that can be asked you also provide the answers that can be given as response."
+    ),
     model=os.getenv("AI_MODEL", "gpt-4o-mini"),
-    tools=[risk_assesment],
-    output_type=Database
+    tools=[risk_assessment],
+    output_type=Database,
 )
 
-@app.get('/AI-response/')
-async def main(prompt):
+
+@app.get("/AI-response/", response_model=Database)
+async def main(prompt: str):
+    """Send meeting notes as `prompt`; get structured insights back."""
     response = await Runner.run(assistant, prompt)
-    data = response.final_output
-    print(f"Response: \n{json.dumps(data.model_dump(),)}")
-    return f"Response: \n{json.dumps(data.model_dump(),)}"
+    return response.final_output
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    uvicorn.run(app, host="127.0.0.1", port=8000)
